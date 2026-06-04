@@ -481,6 +481,18 @@ static void monitor_stdio_and_memory() {
 
     if (pipe(pipefd) == -1) { LOGE("Failed to create stdio pipe"); abort(); }
 
+    // Increase the kernel pipe buffer to 1 MiB so that bursts of box64 log spam
+    // (BOX64_LOG=1 is forced on by box64's built-in Unity profile) don't fill it
+    // before the reader thread drains it.  F_SETPIPE_SZ is Linux-specific but
+    // always available on Android; ignore failure (it's an optimisation).
+    fcntl(pipefd[0], F_SETPIPE_SZ, 1 * 1024 * 1024);
+
+    // Make the WRITE end non-blocking.  Without this, box64's printf() blocks the
+    // emulation thread whenever the pipe is full — stalling the render loop and
+    // producing a permanent black screen.  With O_NONBLOCK the write returns
+    // EAGAIN instead of blocking; a few log lines are dropped but the game runs.
+    fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     dup2(pipefd[1], STDOUT_FILENO);
