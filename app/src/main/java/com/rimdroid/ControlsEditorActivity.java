@@ -58,7 +58,14 @@ public class ControlsEditorActivity extends Activity implements InputControlsVie
 
         float renderScale = 0.72f;
         LauncherPreferences lp = LauncherPreferences.getSingleton();
-        if (lp != null) renderScale = lp.getRenderScale();
+        if (lp != null) {
+            // Match the game's effective scale (stored value raised to the per-device
+            // floor) so edited element positions line up with the running game.
+            android.graphics.Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
+            int sLong  = Math.max(b.width(), b.height());
+            int sShort = Math.min(b.width(), b.height());
+            renderScale = lp.getEffectiveRenderScale(sLong, sShort);
+        }
 
         FrameLayout host = findViewById(R.id.controls_host);
         controls = new InputControlsView(this, renderScale);
@@ -108,6 +115,16 @@ public class ControlsEditorActivity extends Activity implements InputControlsVie
                 v -> { el.setScale(v / 100f); controls.invalidate(); });
         addSlider("Opacity", 5, 100, Math.round(el.getAlpha() / 2.55f), "%",
                 v -> { el.setAlpha(Math.round(v * 2.55f)); controls.invalidate(); });
+        // "Opacity → all": copy THIS element's opacity to every element at once
+        // (Zomdroid-style), instead of adjusting each one separately.
+        Button toAll = new Button(this);
+        toAll.setText("Opacity → all elements");
+        toAll.setOnClickListener(v -> {
+            controls.applyAlphaToAll(el.getAlpha());
+            android.widget.Toast.makeText(this, "Opacity applied to all elements",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        });
+        panelContainer.addView(toAll, rowParams());
 
         if (el instanceof ButtonElement) {
             ButtonElement b = (ButtonElement) el;
