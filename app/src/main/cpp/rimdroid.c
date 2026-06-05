@@ -104,34 +104,76 @@ static void* rimdroid_gles_resolver(const char* name) {
 // (default visibility) so wrappedsdl2.c can rebind/present from the emulated
 // SDL_GL_* intercepts (resolved there as weak externs).
 
+// Whether the ZFA context is currently bound to the calling thread's GL state.
+// Set to 1 after a successful zfaMakeCurrent(); cleared to 0 by
+// rimdroid_zfa_release_current() (called on SDL_GL_MakeCurrent(NULL)) and by
+// rimdroid_zfa_swap() after presenting the frame (so the next make_current
+// re-acquires a fresh swapchain image for the next frame).
+// This prevents calling zfaMakeCurrent() repeatedly within a single frame:
+// each call re-acquires a new Vulkan swapchain image, discarding whatever Unity
+// has rendered so far into the current image — the root cause of the artifacts.
+static volatile int g_zfa_context_bound = 0;
+// Last surface size used when binding; if surface changes we must rebind.
+static int g_zfa_bound_w = 0;
+static int g_zfa_bound_h = 0;
+
 int rimdroid_zfa_make_current(void) {
     if (!p_zfaMakeCurrent || !g_zfa_context) return 0;
     ANativeWindow* w = g_rimdroid_surface.native_window;
-    // RIMDROID: render at the size the game thinks the screen is (dummy SDL =
-    // 1024x768), NOT the physical surface (2340x1080).  This makes our GL surface
-    // / FBO 0 match Unity's resolution belief, removing the FBO-vs-window size
-    // mismatch suspected of triggering the fullscreen GfxDevice teardown loop.
-    // ANativeWindow_setBuffersGeometry resizes the producer buffers; SurfaceFlinger
-    // then scales them to fill the physical SurfaceView (2340x1080).
-    // Render at the NATIVE surface size, taken CONSTANTLY from the surface dims
-    // (captured once in surfaceChanged) — NOT per-call ANativeWindow_getWidth,
-    // which changes when Unity resizes mid-run and made the frame blink then
-    // collapse into a corner. Constant size + forced buffer geometry = stable.
-    // Mirror Zomdroid's ZFA path: do NOT call ANativeWindow_setBuffersGeometry here
-    // (the Java holder.setFixedSize establishes the buffer). Just make current at the
-    // surface size, then force the buffer transform to IDENTITY (below).
+    // Render at the NATIVE surface size, taken from surfaceChanged.
+    // Constant size + forced buffer geometry = stable (per-call ANativeWindow_getWidth
+    // changes when Unity resizes mid-run and makes the frame blink then collapse).
     int rw = g_rimdroid_surface.width  > 0 ? g_rimdroid_surface.width  : 2340;
     int rh = g_rimdroid_surface.height > 0 ? g_rimdroid_surface.height : 1080;
     int ww = w ? rw : 1;
     int hh = w ? rh : 1;
+
+    // Skip zfaMakeCurrent if the context is already bound at the same size.
+    // Calling it again would re-acquire a new Vulkan swapchain image and discard
+    // whatever the game has rendered so far this frame → artifacts.
+    if (g_zfa_context_bound && g_zfa_bound_w == ww && g_zfa_bound_h == hh) {
+        return 1;  // already bound, nothing to do
+    }
+
     if (!p_zfaMakeCurrent(g_zfa_context, w, ww, hh)) {
         LOGE("ZFA: zfaMakeCurrent failed (%dx%d)", ww, hh);
         return 0;
     }
+    g_zfa_context_bound = 1;
+    g_zfa_bound_w = ww;
+    g_zfa_bound_h = hh;
+
+    // Clear the freshly-acquired Vulkan swapchain image.
+    // On PowerVR/Zink, recycled swapchain images have UNDEFINED contents — the GPU
+    // may return whatever was in that memory previously (textures, old frames, etc.)
+    // producing coloured-rectangle artifacts across the whole screen.
+    // Calling glClear immediately after binding FBO 0 forces a full-screen clear
+    // (renderpass loadOp = CLEAR) so Unity always starts painting onto a black slate.
+    // We resolve glClear/glClearColor lazily from libzfa so we don't need a separate
+    // GL loader; the symbols are guaranteed present if zfaMakeCurrent succeeded.
+    {
+        static void (*p_glClear)(unsigned int) = NULL;
+        static void (*p_glClearColor)(float, float, float, float) = NULL;
+        static void (*p_glClearDepthf)(float) = NULL;
+        static int gl_clear_checked = 0;
+        if (!gl_clear_checked) {
+            gl_clear_checked = 1;
+            if (g_zfa_handle) {
+                p_glClear      = (void (*)(unsigned int))        dlsym(g_zfa_handle, "glClear");
+                p_glClearColor = (void (*)(float,float,float,float)) dlsym(g_zfa_handle, "glClearColor");
+                p_glClearDepthf= (void (*)(float))               dlsym(g_zfa_handle, "glClearDepthf");
+            }
+        }
+        if (p_glClear) {
+            if (p_glClearColor)  p_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            if (p_glClearDepthf) p_glClearDepthf(1.0f);
+            p_glClear(0x4000 /* GL_COLOR_BUFFER_BIT */ | 0x0100 /* GL_DEPTH_BUFFER_BIT */);
+        }
+    }
+
     // Force the device-orientation transform to IDENTITY. With the landscape lock,
-    // this cancels the system's portrait pre-rotation → the frame stays HORIZONTAL
-    // (this is the pair that produced yesterday's good horizontal screen). API 26+,
-    // resolved via dlsym.
+    // this cancels the system's portrait pre-rotation → the frame stays HORIZONTAL.
+    // API 26+, resolved via dlsym.
     if (w) {
         static int (*fn_set_transform)(ANativeWindow*, int32_t) = NULL;
         static int checked = 0;
@@ -148,7 +190,21 @@ int rimdroid_zfa_make_current(void) {
 }
 
 void rimdroid_zfa_swap(void) {
-    if (p_zfaFlushFront) p_zfaFlushFront();
+    if (!p_zfaFlushFront) return;
+    // Resolve glFinish lazily from libzfa — ensures all pending GPU commands from
+    // Unity are complete before we hand the swapchain image to the compositor.
+    // Without this, zfaFlushFront() can present a partially-rendered frame.
+    static void (*p_glFinish)(void) = NULL;
+    static int finish_checked = 0;
+    if (!finish_checked) {
+        finish_checked = 1;
+        if (g_zfa_handle) p_glFinish = (void (*)(void))dlsym(g_zfa_handle, "glFinish");
+    }
+    if (p_glFinish) p_glFinish();
+    p_zfaFlushFront();
+    // Mark context as unbound so the next SDL_GL_MakeCurrent re-acquires a fresh
+    // swapchain image for the upcoming frame (instead of re-using the just-presented one).
+    g_zfa_context_bound = 0;
 }
 
 // Release the ZFA/Zink GL context from the CALLING thread (Plan A: serialize the
@@ -156,6 +212,7 @@ void rimdroid_zfa_swap(void) {
 // success, 0 if libzfa doesn't export zfaReleaseCurrent yet (then it's a no-op and
 // behaviour is unchanged).  Called from wrappedsdl2.c on SDL_GL_MakeCurrent(NULL).
 int rimdroid_zfa_release_current(void) {
+    g_zfa_context_bound = 0;  // context released — next make_current must rebind
     if (p_zfaReleaseCurrent) return p_zfaReleaseCurrent();
     return 0;
 }
