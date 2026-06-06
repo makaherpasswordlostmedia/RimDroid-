@@ -128,11 +128,29 @@ int rimdroid_zfa_make_current(void) {
     int ww = w ? rw : 1;
     int hh = w ? rh : 1;
 
-    // Skip zfaMakeCurrent if the context is already bound at the same size.
+    // Skip zfaMakeCurrent if the context is already bound at the same size
+    // AND the surface has not changed since the last bind.
     // Calling it again would re-acquire a new Vulkan swapchain image and discard
     // whatever the game has rendered so far this frame → artifacts.
-    if (g_zfa_context_bound && g_zfa_bound_w == ww && g_zfa_bound_h == hh) {
-        return 1;  // already bound, nothing to do
+    // But if the surface was replaced (is_dirty) we MUST rebind — skipping here
+    // is the root cause of the black-screen after the second Surface init call.
+    bool surface_dirty = false;
+    pthread_mutex_lock(&g_rimdroid_surface.mutex);
+    if (g_rimdroid_surface.is_dirty) {
+        surface_dirty = true;
+        g_rimdroid_surface.is_dirty = false;
+    }
+    pthread_mutex_unlock(&g_rimdroid_surface.mutex);
+
+    if (!surface_dirty && g_zfa_context_bound && g_zfa_bound_w == ww && g_zfa_bound_h == hh) {
+        return 1;  // already bound to the current surface at the same size, nothing to do
+    }
+    // Surface changed or size changed — invalidate cached bind dimensions so the
+    // full zfaMakeCurrent path runs below (clears swapchain image, sets transform).
+    if (surface_dirty) {
+        g_zfa_context_bound = 0;
+        g_zfa_bound_w = 0;
+        g_zfa_bound_h = 0;
     }
 
     if (!p_zfaMakeCurrent(g_zfa_context, w, ww, hh)) {
@@ -774,7 +792,7 @@ static void launch_rimworld_elf(const char* game_dir_path, int argc, const char*
     for (int i = 0; i < argc; i++) full_argv[i + 1] = argv[i];
     for (int i = 0; i < extra_n; i++) full_argv[argc + 1 + i] = extra_argv[i];
 
-    LOGI("Executing: %s (+ -screen-fullscreen 0 -screen-width 2340 -screen-height 1080)", binary_path);
+    LOGI("Executing: %s (+ -screen-fullscreen 0 -screen-width %d -screen-height %d)", binary_path, nw, nh);
     run_elf_file(binary_path, argc + extra_n + 1, full_argv);
     free(full_argv);
 }
