@@ -546,6 +546,203 @@ static int rimdroid_init_gl4es_egl(ANativeWindow* nativeWindow) {
     return 0;
 }
 
+// ---- OSMesa (softpipe) state ------------------------------------------------
+// Persistent context used by the RD_ZINK_OSMESA renderer path.
+// Initialised once by rimdroid_init_osmesa(); driven per-frame by
+// rimdroid_osmesa_make_current() + rimdroid_osmesa_swap().
+// Exported as globals so box64's wrappedsdl2.c can weak-ref them to detect
+// the softpipe path (NULL = not active).
+void* g_osmesa_context = NULL;  // OSMesaContext
+void* g_osmesa_handle  = NULL;  // dlopen handle for libOSMesa.so
+
+// OSMesa function pointers shared across smoketest / init / make_current / swap.
+typedef void*         (*PFN_OSMesaCreateContextAttribs)(const int*, void*);
+typedef void*         (*PFN_OSMesaCreateContext)(unsigned int, void*);
+typedef unsigned char (*PFN_OSMesaMakeCurrent)(void*, void*, unsigned int, int, int);
+typedef void          (*PFN_OSMesaDestroyContext)(void*);
+
+static PFN_OSMesaCreateContextAttribs p_OSMesaCreateContextAttribs = NULL;
+static PFN_OSMesaCreateContext        p_OSMesaCreateContext        = NULL;
+static PFN_OSMesaMakeCurrent          p_OSMesaMakeCurrent          = NULL;
+static PFN_OSMesaDestroyContext       p_OSMesaDestroyContext       = NULL;
+
+// Offscreen pixel buffer for the persistent OSMesa path.
+// Sized for the native resolution; Unity renders here and swap() blits to surface.
+#define OSMESA_BUF_W 2340
+#define OSMESA_BUF_H 1080
+static unsigned char g_osmesa_buf[OSMESA_BUF_W * OSMESA_BUF_H * 4];
+
+// ---- OSMesa smoketest -------------------------------------------------------
+// Called from JNI (nativeOsmesaSmokeTest).  Loads libOSMesa.so from the
+// absolute path supplied by Java (the deps dir), creates a tiny offscreen
+// context, renders a frame, and confirms GL_VERSION is non-NULL.
+// Returns 0 on success (matches the JNI convention used by the caller).
+
+int rimdroid_osmesa_smoketest(const char* osmesa_lib_path) {
+    const char* path = (osmesa_lib_path && osmesa_lib_path[0])
+                       ? osmesa_lib_path : "libOSMesa.so";
+
+    void* osmesa = linkernsbypass_namespace_dlopen(path, RTLD_GLOBAL, rimdroid_ns);
+    if (!osmesa) {
+        // Fallback: try the default namespace (useful if rimdroid_ns not yet set up)
+        osmesa = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+    }
+    if (!osmesa) {
+        LOGE("OSMesa smoketest: dlopen('%s') failed: %s", path, dlerror());
+        return 0;
+    }
+
+    PFN_OSMesaCreateContext  fn_create  =
+        (PFN_OSMesaCreateContext) dlsym(osmesa, "OSMesaCreateContext");
+    PFN_OSMesaMakeCurrent    fn_makcur  =
+        (PFN_OSMesaMakeCurrent)  dlsym(osmesa, "OSMesaMakeCurrent");
+    PFN_OSMesaDestroyContext fn_destroy =
+        (PFN_OSMesaDestroyContext)dlsym(osmesa, "OSMesaDestroyContext");
+
+    if (!fn_create || !fn_makcur || !fn_destroy) {
+        LOGE("OSMesa smoketest: missing entry points (create=%p makecur=%p destroy=%p)",
+             (void*)fn_create, (void*)fn_makcur, (void*)fn_destroy);
+        return 0;
+    }
+
+    void* ctx = fn_create(0x1908 /* GL_RGBA */, NULL);
+    if (!ctx) {
+        LOGE("OSMesa smoketest: OSMesaCreateContext failed");
+        return 0;
+    }
+
+    static unsigned char buf[4 * 4 * 4];
+    if (!fn_makcur(ctx, buf, 0x1401 /* GL_UNSIGNED_BYTE */, 4, 4)) {
+        LOGE("OSMesa smoketest: OSMesaMakeCurrent failed");
+        fn_destroy(ctx);
+        return 0;
+    }
+
+    const unsigned char* (*p_glGetString)(unsigned int) =
+        (const unsigned char*(*)(unsigned int))dlsym(osmesa, "glGetString");
+    const char* ver = p_glGetString ? (const char*)p_glGetString(0x1F02 /* GL_VERSION */) : NULL;
+    LOGI("OSMesa smoketest: GL_VERSION='%s' — PASS", ver ? ver : "(null)");
+
+    fn_destroy(ctx);
+    return 0;  // 0 = success (JNI convention)
+}
+
+// ---- OSMesa persistent renderer (Milestone 2 / RD_ZINK_OSMESA) --------------
+
+// Load libOSMesa.so, resolve entry points, create a GL 3.3 CORE context.
+// Called once at launch (before fork or in standalone).  Returns 0 on success.
+int rimdroid_init_osmesa(void) {
+    if (g_osmesa_context) return 0;  // already initialised
+
+    g_osmesa_handle = linkernsbypass_namespace_dlopen("libOSMesa.so", RTLD_GLOBAL, rimdroid_ns);
+    if (!g_osmesa_handle)
+        g_osmesa_handle = dlopen("libOSMesa.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_osmesa_handle) {
+        LOGE("OSMesa init: dlopen(libOSMesa.so) failed: %s", dlerror());
+        return -1;
+    }
+
+    p_OSMesaCreateContextAttribs =
+        (PFN_OSMesaCreateContextAttribs)dlsym(g_osmesa_handle, "OSMesaCreateContextAttribs");
+    p_OSMesaCreateContext  =
+        (PFN_OSMesaCreateContext) dlsym(g_osmesa_handle, "OSMesaCreateContext");
+    p_OSMesaMakeCurrent    =
+        (PFN_OSMesaMakeCurrent)   dlsym(g_osmesa_handle, "OSMesaMakeCurrent");
+    p_OSMesaDestroyContext =
+        (PFN_OSMesaDestroyContext) dlsym(g_osmesa_handle, "OSMesaDestroyContext");
+
+    if (!p_OSMesaMakeCurrent || !p_OSMesaDestroyContext ||
+        (!p_OSMesaCreateContextAttribs && !p_OSMesaCreateContext)) {
+        LOGE("OSMesa init: missing required entry points");
+        return -1;
+    }
+
+    // Prefer a GL 3.3 CORE context via OSMesaCreateContextAttribs (Mesa 19+).
+    // Fall back to the older OSMesaCreateContext (RGBA, no shared ctx) for
+    // older softpipe builds that don't export the attribs variant.
+    if (p_OSMesaCreateContextAttribs) {
+        // OSMESA_FORMAT=OSMESA_RGBA(0x1908), OSMESA_DEPTH_BITS=24,
+        // OSMESA_STENCIL_BITS=8, OSMESA_PROFILE=OSMESA_CORE_PROFILE(0x2),
+        // OSMESA_CONTEXT_MAJOR_VERSION=3, OSMESA_CONTEXT_MINOR_VERSION=3
+        const int attribs[] = {
+            0x22 /* OSMESA_FORMAT */,                  0x1908,
+            0x30 /* OSMESA_DEPTH_BITS */,              24,
+            0x31 /* OSMESA_STENCIL_BITS */,            8,
+            0x32 /* OSMESA_PROFILE */,                 0x2,   // CORE
+            0x33 /* OSMESA_CONTEXT_MAJOR_VERSION */,   3,
+            0x34 /* OSMESA_CONTEXT_MINOR_VERSION */,   3,
+            0
+        };
+        g_osmesa_context = p_OSMesaCreateContextAttribs(attribs, NULL);
+        LOGI("OSMesa init: OSMesaCreateContextAttribs → ctx=%p", g_osmesa_context);
+    }
+    if (!g_osmesa_context && p_OSMesaCreateContext) {
+        g_osmesa_context = p_OSMesaCreateContext(0x1908 /* GL_RGBA */, NULL);
+        LOGI("OSMesa init: OSMesaCreateContext fallback → ctx=%p", g_osmesa_context);
+    }
+    if (!g_osmesa_context) {
+        LOGE("OSMesa init: context creation failed");
+        return -1;
+    }
+
+    LOGI("OSMesa init: context %p ready (softpipe, buf=%dx%d)",
+         g_osmesa_context, OSMESA_BUF_W, OSMESA_BUF_H);
+    return 0;
+}
+
+// Bind the OSMesa context + CPU pixel buffer to the calling thread.
+// Called by wrappedsdl2.c on SDL_GL_MakeCurrent.  Returns 1 on success.
+int rimdroid_osmesa_make_current(void) {
+    if (!g_osmesa_context || !p_OSMesaMakeCurrent) return 0;
+    int w = g_rimdroid_surface.width  > 0 ? g_rimdroid_surface.width  : OSMESA_BUF_W;
+    int h = g_rimdroid_surface.height > 0 ? g_rimdroid_surface.height : OSMESA_BUF_H;
+    // Clamp to buffer dimensions
+    if (w > OSMESA_BUF_W) w = OSMESA_BUF_W;
+    if (h > OSMESA_BUF_H) h = OSMESA_BUF_H;
+    if (!p_OSMesaMakeCurrent(g_osmesa_context, g_osmesa_buf,
+                             0x1401 /* GL_UNSIGNED_BYTE */, w, h)) {
+        LOGE("OSMesa make_current: OSMesaMakeCurrent failed (%dx%d)", w, h);
+        return 0;
+    }
+    LOGI("OSMesa make_current: bound %dx%d", w, h);
+    return 1;
+}
+
+// Blit the CPU pixel buffer to the ANativeWindow surface and present.
+// Called by wrappedsdl2.c on SDL_GL_SwapWindow.
+void rimdroid_osmesa_swap(void) {
+    ANativeWindow* win = g_rimdroid_surface.native_window;
+    if (!win) {
+        LOGW("OSMesa swap: no native_window");
+        return;
+    }
+
+    int w = g_rimdroid_surface.width  > 0 ? g_rimdroid_surface.width  : OSMESA_BUF_W;
+    int h = g_rimdroid_surface.height > 0 ? g_rimdroid_surface.height : OSMESA_BUF_H;
+    if (w > OSMESA_BUF_W) w = OSMESA_BUF_W;
+    if (h > OSMESA_BUF_H) h = OSMESA_BUF_H;
+
+    ANativeWindow_setBuffersGeometry(win, w, h, 1 /* WINDOW_FORMAT_RGBA_8888 */);
+
+    ANativeWindow_Buffer nb;
+    if (ANativeWindow_lock(win, &nb, NULL) != 0) {
+        LOGE("OSMesa swap: ANativeWindow_lock failed");
+        return;
+    }
+
+    // Copy rows from the OSMesa buffer (bottom-up) to the window buffer (top-down).
+    // OSMesa stores rows bottom-first (OpenGL convention); ANativeWindow expects top-first.
+    const int copy_w = (nb.width  < w) ? nb.width  : w;
+    const int copy_h = (nb.height < h) ? nb.height : h;
+    for (int row = 0; row < copy_h; row++) {
+        const unsigned char* src = g_osmesa_buf + ((h - 1 - row) * w * 4);
+        unsigned char*       dst = (unsigned char*)nb.bits + row * nb.stride * 4;
+        memcpy(dst, src, (size_t)copy_w * 4);
+    }
+
+    ANativeWindow_unlockAndPost(win);
+}
+
 // ---- Memory / stdio monitor -------------------------------------------------
 
 static long get_mem_available_mb() {
