@@ -1147,6 +1147,18 @@ void rimdroid_start_game(const char* game_dir_path,
             setenv("GC_INITIAL_HEAP_SIZE", "1073741824", 1);   // 1 GiB
             setenv("GC_FREE_SPACE_DIVISOR", "1", 1);
             LOGI("Boehm GC: initial heap 1GiB, free_space_divisor=1 (fewer STW GCs)");
+
+            // PowerVR B-Series does not support fillModeNonSolid (Vulkan feature).
+            // Zink detects this and logs "Some incorrect rendering might occur",
+            // but still tries to use wireframe/point fill modes → produces
+            // coloured garbage rectangles visible on screen.
+            // ZINK_FORCE_FILL_MODE=fill tells Mesa/Zink to always emit
+            // VK_POLYGON_MODE_FILL, never LINE/POINT, on unsupported devices.
+            setenv("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE", "1", 1);
+            setenv("ZINK_DEBUG", "compact", 1);
+            setenv("ZINK_FORCE_FILL_MODE", "fill", 1);
+            LOGI("Zink/PowerVR workaround: ZINK_FORCE_FILL_MODE=fill (fillModeNonSolid not supported)");
+
             launch_rimworld_elf(game_dir_path, argc, argv);
             LOGI("In-process launch returned");
             LOGI("rimdroid_start_game: done (in-process)");
@@ -1282,6 +1294,12 @@ void rimdroid_start_game(const char* game_dir_path,
                 LOGE("Child: ZFA not initialised in parent");
             }
         }
+
+        // Same PowerVR fillModeNonSolid workaround as the in-process path.
+        setenv("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE", "1", 1);
+        setenv("ZINK_DEBUG", "compact", 1);
+        setenv("ZINK_FORCE_FILL_MODE", "fill", 1);
+        LOGI("Child: Zink/PowerVR workaround applied (ZINK_FORCE_FILL_MODE=fill)");
 
         launch_rimworld_elf(game_dir_path, argc, argv);
         LOGI("Child: launch_rimworld_elf returned");
